@@ -184,6 +184,8 @@ const (
 	numQueryStmtsRx                   = "query_stmts_rx"
 	numRequests                       = "requests"
 	numRequestStmtsRx                 = "request_stmts_rx"
+	numReadBarrierFailed              = "read_barrier_failed"
+	numReadBarrierTimeout             = "read_barrier_timeout"
 	numReadyz                         = "num_readyz"
 	numStatus                         = "num_status"
 	numBackups                        = "backups"
@@ -258,6 +260,8 @@ func ResetStats() {
 	stats.Add(numQueryStmtsRx, 0)
 	stats.Add(numRequests, 0)
 	stats.Add(numRequestStmtsRx, 0)
+	stats.Add(numReadBarrierFailed, 0)
+	stats.Add(numReadBarrierTimeout, 0)
 	stats.Add(numReadyz, 0)
 	stats.Add(numStatus, 0)
 	stats.Add(numBackups, 0)
@@ -1602,6 +1606,31 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams
 	s.writeResponse(w, qp, resp)
 }
 
+// writeReadBarrierError maps a failed LINEARIZABLE read barrier to an
+// identifiable HTTP response. It returns true when err is a read-barrier
+// error and the response has been written. A barrier timeout -- including
+// client cancellation while waiting -- is reported as 504 Gateway
+// Timeout; any other unconfirmed barrier is reported as 503 Service
+// Unavailable. The read is never served from local state on this path,
+// so the client can distinguish "barrier unconfirmed" from a normal
+// query response.
+func (s *Service) writeReadBarrierError(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, proxy.ErrReadBarrierTimeout) {
+		stats.Add(numReadBarrierTimeout, 1)
+		http.Error(w, err.Error(), http.StatusGatewayTimeout)
+		return true
+	}
+	if errors.Is(err, proxy.ErrReadBarrier) {
+		stats.Add(numReadBarrierFailed, 1)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return true
+	}
+	return false
+}
+
 // handleQuery handles queries that do not modify the database.
 func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1682,6 +1711,9 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryPa
 			http.Error(w, "remote query not authorized", http.StatusUnauthorized)
 			return
 		}
+		if s.writeReadBarrierError(w, resultsErr) {
+			return
+		}
 	}
 
 	if resultsErr != nil {
@@ -1757,6 +1789,9 @@ func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp Query
 		}
 		if errors.Is(resultsErr, proxy.ErrUnauthorized) {
 			http.Error(w, "remote Request not authorized", http.StatusUnauthorized)
+			return
+		}
+		if s.writeReadBarrierError(w, resultsErr) {
 			return
 		}
 	}

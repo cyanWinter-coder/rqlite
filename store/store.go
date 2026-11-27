@@ -94,6 +94,17 @@ var (
 	// index within the specified time.
 	ErrWaitForFSMTimeout = errors.New("timeout waiting for fsm")
 
+	// ErrReadBarrier is returned when a LINEARIZABLE read's read barrier
+	// cannot be confirmed. The concrete failure is wrapped, so callers can
+	// use errors.Is(err, ErrReadBarrier) to distinguish a failed barrier
+	// from any other query error. A LINEARIZABLE read that fails the barrier
+	// never falls back to a local read.
+	ErrReadBarrier = errors.New("read barrier confirmation failed")
+
+	// ErrReadBarrierTimeout is returned when a LINEARIZABLE read's read
+	// barrier is not confirmed within the requested time.
+	ErrReadBarrierTimeout = errors.New("read barrier confirmation timed out")
+
 	// ErrInvalidBackupFormat is returned when the requested backup format
 	// is not valid.
 	ErrInvalidBackupFormat = errors.New("invalid backup format")
@@ -212,6 +223,15 @@ const (
 	failedHeartbeatObserved     = "failed_heartbeat_observed"
 	nodesReapedOK               = "nodes_reaped_ok"
 	nodesReapedFailed           = "nodes_reaped_failed"
+
+	// Metrics for the read barrier used by LINEARIZABLE reads. These are
+	// exposed both via expvar (under "store") and Store.Stats().
+	numBarrierWaits        = "num_barrier_waits"
+	numBarrierWaitFailures = "num_barrier_wait_failures"
+	numBarrierTimeouts     = "num_barrier_timeouts"
+	numBarrierRetries      = "num_barrier_retries"
+	barrierWaitDuration    = "barrier_wait_duration_ms"
+	barrierInFlight        = "barrier_in_flight"
 )
 
 // stats captures stats for the Store.
@@ -283,6 +303,13 @@ func ResetStats() {
 	stats.Add(failedHeartbeatObserved, 0)
 	stats.Add(nodesReapedOK, 0)
 	stats.Add(nodesReapedFailed, 0)
+	stats.Add(numBarrierWaits, 0)
+	stats.Add(numBarrierWaitFailures, 0)
+	stats.Add(numBarrierTimeouts, 0)
+	stats.Add(numBarrierRetries, 0)
+	stats.Add(barrierWaitDuration, 0)
+	// barrierInFlight is a gauge and is re-created on every reset.
+	stats.Set(barrierInFlight, new(expvar.Int))
 }
 
 // SnapshotStore is the interface Snapshot stores must implement.
@@ -382,6 +409,10 @@ type Store struct {
 	appendedAtTime *rsync.AtomicTime
 
 	strongReadTerm atomic.Uint64 // Term of most recent Strong Read
+
+	// readBarrier observes the read barriers performed for LINEARIZABLE
+	// reads, exposing queue depth, failure/retry counts and wait timings.
+	readBarrier *readBarrierTracker
 
 	dbModifiedTime *rsync.AtomicTime // Last time the database file was modified.
 
@@ -499,6 +530,7 @@ func New(c *Config, ly Layer) *Store {
 		appendedAtTime:    rsync.NewAtomicTime(),
 		dbModifiedTime:    rsync.NewAtomicTime(),
 		appliedTarget:     rsync.NewReadyTarget[uint64](),
+		readBarrier:       newReadBarrierTracker(),
 	}
 }
 
@@ -1428,6 +1460,7 @@ func (s *Store) Stats() (map[string]any, error) {
 		"fsm_term":         s.fsmTerm.Load(),
 		"fsm_update_time":  s.fsmUpdateTime.Load(),
 		"strong_read_term": s.strongReadTerm.Load(),
+		"read_barrier":     s.readBarrier.stats(),
 		"db_applied_index": s.dbAppliedIdx.Load(),
 		"addr":             s.Addr(),
 		"leader": map[string]string{
@@ -1568,12 +1601,15 @@ func (s *Store) Query(ctx context.Context, qr *proto.QueryRequest) (rows []*prot
 
 	readTerm := s.raft.CurrentTerm()
 	if level == proto.ConsistencyLevel_LINEARIZABLE {
-		err := s.waitForLinearizableRead(readTerm, qr.LinearizableTimeout)
+		err := s.waitForLinearizableRead(ctx, readTerm, qr.LinearizableTimeout)
 		if err != nil {
-			if err == ErrStrongReadNeeded {
+			if errors.Is(err, ErrStrongReadNeeded) {
 				level = proto.ConsistencyLevel_STRONG
 				s.numLRUpgraded.Add(1)
 			} else {
+				// The barrier could not be confirmed. Never serve a local
+				// read for a LINEARIZABLE request: surface the identifiable
+				// barrier error to the caller.
 				return nil, 0, 0, err
 			}
 		}
@@ -1630,6 +1666,16 @@ func (s *Store) Query(ctx context.Context, qr *proto.QueryRequest) (rows []*prot
 	return rows, level, 0, err
 }
 
+// ReadBarrierStats returns point-in-time observability data for the read
+// barriers performed on behalf of LINEARIZABLE reads: the number of
+// barrier attempts currently queued or in flight, cumulative waits,
+// confirmation failures (including timeouts), timeouts alone, retries
+// (attempts after the first within one request), and the duration of
+// every retained barrier wait.
+func (s *Store) ReadBarrierStats() map[string]any {
+	return s.readBarrier.stats()
+}
+
 // VerifyLeader checks that the current node is the Raft leader.
 func (s *Store) VerifyLeader() (retErr error) {
 	if !s.open.Is() {
@@ -1681,12 +1727,13 @@ func (s *Store) Request(ctx context.Context, eqr *proto.ExecuteQueryRequest) ([]
 	// See the Query() code for a full explanation of this.
 	readTerm := s.raft.CurrentTerm()
 	if level == proto.ConsistencyLevel_LINEARIZABLE {
-		err := s.waitForLinearizableRead(readTerm, eqr.LinearizableTimeout)
+		err := s.waitForLinearizableRead(ctx, readTerm, eqr.LinearizableTimeout)
 		if err != nil {
-			if err == ErrStrongReadNeeded {
+			if errors.Is(err, ErrStrongReadNeeded) {
 				level = proto.ConsistencyLevel_STRONG
 				s.numLRUpgraded.Add(1)
 			} else {
+				// Unconfirmed barrier: do not fall through to a local read.
 				return nil, 0, 0, err
 			}
 		}
@@ -2536,10 +2583,32 @@ func (s *Store) raftConfig() *raft.Config {
 	return config
 }
 
+// maxBarrierAttempts bounds the number of times a single LINEARIZABLE
+// read re-runs its read barrier after a transient confirmation failure.
+// The first attempt is not a retry; up to maxBarrierAttempts-1 further
+// attempts may follow, each observed by the read-barrier tracker.
+const maxBarrierAttempts = 3
+
 // waitForLinearizableRead performs the preprocessing needed for a
-// linearizable read, or times out. Once this function returns without
-// error subsequent reads on the Leader will be linearizable.
-func (s *Store) waitForLinearizableRead(currReadTerm uint64, linearizableTimeoutParam int64) error {
+// linearizable read, or fails/times out. Once this function returns
+// without error subsequent reads on the Leader will be linearizable.
+//
+// The barrier is never downgraded to a local read: if leadership cannot
+// be confirmed, the term changes under the barrier, or the FSM does not
+// reach the required commit index in time, an identifiable error is
+// returned. The only non-fatal outcome is ErrStrongReadNeeded, which
+// directs the caller to establish this term's strong-read term via a
+// consensus round-trip rather than reading locally.
+//
+// A transient barrier failure (a lost quorum heartbeat round-trip or a
+// changed term) is retried in place, bounded by maxBarrierAttempts, so
+// a short leader-election hiccup does not surface to the client while a
+// genuine loss of leadership still fails with ErrNotLeader. Every
+// attempt is observed by the read-barrier tracker, which records queue
+// depth, failures, retries and per-attempt wait duration; retries are
+// counted separately and one request can never be recorded as two
+// confirmations.
+func (s *Store) waitForLinearizableRead(ctx context.Context, currReadTerm uint64, linearizableTimeoutParam int64) error {
 	// If linearizable consistency is requested, we will need to check the
 	// term when heartbeat processing completes to ensure the Leader didn't
 	// change during the processing of a Linearizable read. We also need to
@@ -2562,27 +2631,81 @@ func (s *Store) waitForLinearizableRead(currReadTerm uint64, linearizableTimeout
 		return ErrNotReady
 	}
 
-	// Implement the technique from the Raft dissertation, section
-	// 6.4 "Processing read-only queries more efficiently".
-	readIndex := s.raft.CommitIndex()
-	if err := s.VerifyLeader(); err != nil {
-		return err
-	}
-	if s.raft.CurrentTerm() != currReadTerm {
-		return ErrStaleRead
-	}
 	lt := time.Duration(linearizableTimeoutParam)
 	if lt == 0 {
 		lt = linearizableTimeout
 	}
 
-	// Now, wait for it.
+	var lastErr error
+	for attempt := 0; attempt < maxBarrierAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: %w", ErrReadBarrierTimeout, err)
+		}
+		err := s.runReadBarrier(ctx, currReadTerm, lt, attempt > 0)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		// Timeouts and cancellation are terminal: retrying against the
+		// same deadline cannot succeed and would only burn the budget.
+		if errors.Is(err, ErrReadBarrierTimeout) {
+			return err
+		}
+		// Losing leadership is terminal for this node; the caller's
+		// proxy will forward to the new leader instead of reading here.
+		if errors.Is(err, ErrNotLeader) {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// runReadBarrier executes one read-barrier attempt and observes it via
+// the read-barrier tracker. A nil return means the barrier is confirmed
+// for currReadTerm.
+func (s *Store) runReadBarrier(ctx context.Context, currReadTerm uint64, lt time.Duration, isRetry bool) (retErr error) {
+	finish := s.readBarrier.begin(isRetry)
+	defer func() {
+		finish(retErr)
+	}()
+
+	// Implement the technique from the Raft dissertation, section
+	// 6.4 "Processing read-only queries more efficiently".
+	readIndex := s.raft.CommitIndex()
+	if err := s.VerifyLeader(); err != nil {
+		// Quorum could not confirm this node is the leader: the barrier
+		// is unconfirmed and the read must not fall back to local state.
+		if errors.Is(err, ErrNotLeader) {
+			return err
+		}
+		return fmt.Errorf("%w: verify leader: %s", ErrReadBarrier, err.Error())
+	}
+	if s.raft.CurrentTerm() != currReadTerm {
+		// Leadership changed while the barrier was in flight. A result
+		// served now could regress relative to an earlier response, so
+		// the barrier fails rather than reading locally.
+		return fmt.Errorf("%w: %s", ErrReadBarrier, ErrStaleRead.Error())
+	}
+
+	// Now, wait for the local FSM to have applied everything committed
+	// up to the observed index. Honor both the barrier timeout and the
+	// caller's context, and clean up the subscription on every path so
+	// queued-wait accounting cannot leak.
 	ch := s.fsmTarget.Subscribe(readIndex)
+	timer := time.NewTimer(lt)
+	defer timer.Stop()
 	select {
 	case <-ch:
+		// Already signaled, but unsubscribe anyway so no subscriber slot
+		// lingers until the next Signal during a leadership-change storm.
+		s.fsmTarget.Unsubscribe(ch)
 		return nil
-	case <-time.After(lt):
-		return fmt.Errorf("index %d: %w", readIndex, ErrWaitForFSMTimeout)
+	case <-timer.C:
+		s.fsmTarget.Unsubscribe(ch)
+		return fmt.Errorf("index %d: %w: %w", readIndex, ErrReadBarrierTimeout, ErrWaitForFSMTimeout)
+	case <-ctx.Done():
+		s.fsmTarget.Unsubscribe(ch)
+		return fmt.Errorf("%w: %w", ErrReadBarrierTimeout, ctx.Err())
 	}
 }
 

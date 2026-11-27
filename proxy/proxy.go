@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"expvar"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +31,17 @@ var (
 	// ErrNodeNotFound is returned when a node referenced by ID is not
 	// found in the cluster.
 	ErrNodeNotFound = store.ErrNodeNotFound
+
+	// ErrReadBarrier is returned when a LINEARIZABLE read's read barrier
+	// cannot be confirmed. It is an alias so errors.Is matches the error
+	// whether it originated in the local Store or came back from a remote
+	// node (remote errors arrive as strings and are re-wrapped by the
+	// cluster layer). A failed barrier never degrades to a local read.
+	ErrReadBarrier = store.ErrReadBarrier
+
+	// ErrReadBarrierTimeout is returned when a LINEARIZABLE read's read
+	// barrier is not confirmed in time.
+	ErrReadBarrierTimeout = store.ErrReadBarrierTimeout
 
 	// ErrUnauthorized is returned when the remote node rejects credentials.
 	ErrUnauthorized = errors.New("unauthorized")
@@ -373,5 +386,29 @@ func wrapIfUnauthorized(err error) error {
 	if err.Error() == "unauthorized" {
 		return ErrUnauthorized
 	}
-	return err
+	return wrapReadBarrier(err)
+}
+
+// wrapReadBarrier restores the read-barrier sentinels for an error
+// returned by a remote node. Remote errors cross the cluster protocol
+// as a bare string, so the identifiable barrier error messages are
+// matched by substring and re-wrapped, letting the HTTP layer map them
+// to a distinct status code instead of treating them as a generic
+// failure. Local-Store errors already wrap the sentinels and pass
+// through unchanged.
+func wrapReadBarrier(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	switch {
+	case errors.Is(err, ErrReadBarrierTimeout),
+		strings.Contains(msg, ErrReadBarrierTimeout.Error()):
+		return fmt.Errorf("%w: %s", ErrReadBarrierTimeout, msg)
+	case errors.Is(err, ErrReadBarrier),
+		strings.Contains(msg, ErrReadBarrier.Error()):
+		return fmt.Errorf("%w: %s", ErrReadBarrier, msg)
+	default:
+		return err
+	}
 }
