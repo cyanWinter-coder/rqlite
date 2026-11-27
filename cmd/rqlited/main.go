@@ -161,9 +161,19 @@ func main() {
 		} else {
 			log.Printf("auto-restore requested, initiating download")
 			start := time.Now()
-			path, errOK, err := restore.DownloadFile(mainCtx, cfg.AutoRestoreFile)
+			// Keep rejected snapshots under the node's data directory so they
+			// survive temp cleanup and are easy to locate during triage.
+			qDir := filepath.Join(cfg.DataPath, "restore-quarantine")
+			path, errOK, err := restore.DownloadFileToQuarantine(mainCtx, cfg.AutoRestoreFile, qDir)
 			if err != nil {
 				var b strings.Builder
+				if restore.IsVerificationError(err) {
+					// A corrupt or unverifiable snapshot must never start a
+					// node. The object is preserved in the quarantine
+					// directory for manual investigation.
+					b.WriteString(fmt.Sprintf("auto-restore snapshot rejected, refusing to start: %s", err.Error()))
+					log.Fatal(b.String())
+				}
 				b.WriteString(fmt.Sprintf("failed to download auto-restore file: %s", err.Error()))
 				if errOK {
 					b.WriteString(", continuing with node startup anyway")

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rqlite/rqlite/v10/auto/file"
+	"github.com/rqlite/rqlite/v10/auto/verify"
 )
 
 func Test_Uploader_FileStorage_Timestamped(t *testing.T) {
@@ -95,8 +96,8 @@ func Test_Uploader_FileStorage_Timestamped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read data file: %s", err.Error())
 	}
-	if string(data) != "test backup data" {
-		t.Fatalf("data mismatch: got %q want %q", string(data), "test backup data")
+	if payload := mustVerifiedPayload(t, data); payload != "test backup data" {
+		t.Fatalf("data mismatch: got %q want %q", payload, "test backup data")
 	}
 }
 
@@ -149,7 +150,18 @@ func Test_Uploader_FileStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read data file: %s", err.Error())
 	}
-	if string(data) != "my upload data" {
-		t.Fatalf("data mismatch: got %q want %q", string(data), "my upload data")
+	if payload := mustVerifiedPayload(t, data); payload != "my upload data" {
+		t.Fatalf("data mismatch: got %q want %q", payload, "my upload data")
 	}
+}
+
+// mustVerifiedPayload verifies the object's self-describing checksum and
+// returns the original payload bytes as a string.
+func mustVerifiedPayload(t *testing.T, object []byte) string {
+	t.Helper()
+	_, payload, err := verify.VerifyBytes(object)
+	if err != nil {
+		t.Fatalf("stored object failed verification: %s", err)
+	}
+	return string(payload)
 }

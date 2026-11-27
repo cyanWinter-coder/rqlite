@@ -123,6 +123,10 @@ var (
 	// WAL data to snapshot. This can happen when the Raft log contains only entries
 	// that don't modify the database (e.g. cluster membership changes).
 	ErrNoWALToSnapshot = errors.New("no WAL data available for snapshot")
+
+	// ErrNoRestorePending is returned by RetryRestore when no failed
+	// auto-restore is staged for a retry.
+	ErrNoRestorePending = errors.New("no failed auto-restore is pending retry")
 )
 
 const (
@@ -339,6 +343,15 @@ type Store struct {
 	restorePath   string
 	restoreDoneCh chan struct{}
 
+	// restoreMu guards the observable auto-restore state below. A failed
+	// restore is retained as a distinct, retryable state instead of being
+	// reported as success.
+	restoreMu         sync.RWMutex
+	restoreState      RestoreState
+	restoreErr        error
+	restoreAttempt    int
+	restoreUpdateTime time.Time
+
 	raft    *raft.Raft // The consensus mechanism.
 	ly      Layer
 	raftTn  *NodeTransport
@@ -478,6 +491,7 @@ func New(c *Config, ly Layer) *Store {
 		peersInfoPath:     filepath.Join(c.Dir, peersInfoPath),
 		cleanSnapshotPath: filepath.Join(c.Dir, cleanSnapshotName),
 		restoreDoneCh:     make(chan struct{}),
+		restoreState:      RestoreStateNone,
 		raftID:            c.ID,
 		dbConf:            c.DBConf,
 		dbPath:            dbPath,
@@ -520,7 +534,12 @@ func (s *Store) SetRestorePath(path string) error {
 	}
 
 	s.RegisterReadyChannel(s.restoreDoneCh)
+	s.restoreMu.Lock()
 	s.restorePath = path
+	s.restoreState = RestoreStatePending
+	s.restoreErr = nil
+	s.restoreUpdateTime = time.Now()
+	s.restoreMu.Unlock()
 	return nil
 }
 
@@ -1461,6 +1480,7 @@ func (s *Store) Stats() (map[string]any, error) {
 		"dir_size_friendly":      friendlyBytes(uint64(dirSz)),
 		"sqlite3":                dbStatus,
 		"db_conf":                s.dbConf,
+		"auto_restore":           s.RestoreStatus(),
 	}
 
 	if s.AutoVacInterval > 0 {
@@ -3184,32 +3204,63 @@ func (s *Store) runWALSnapshotting() (closeCh, doneCh chan struct{}) {
 // selfLeaderChange is called when this node detects that its leadership
 // status has changed.
 func (s *Store) selfLeaderChange(leader bool) {
-	if s.restorePath != "" {
-		defer func() {
-			// Whatever happens, this is a one-shot attempt to perform a restore
-			err := fsutil.Remove(s.restorePath)
-			if err != nil {
-				s.logger.Printf("failed to remove restore path after restore %s: %s",
-					s.restorePath, err.Error())
-			}
-			s.restorePath = ""
-			close(s.restoreDoneCh)
-		}()
-
-		if !leader {
-			s.logger.Printf("different node became leader, not performing auto-restore")
-			stats.Add(numAutoRestoresSkipped, 1)
-		} else {
-			s.logger.Printf("this node is now leader, auto-restoring from %s", s.restorePath)
-			if err := s.installRestore(); err != nil {
-				s.logger.Printf("failed to auto-restore from %s: %s", s.restorePath, err.Error())
-				stats.Add(numAutoRestoresFailed, 1)
-				return
-			}
-			stats.Add(numAutoRestores, 1)
-			s.logger.Printf("node auto-restored successfully from %s", s.restorePath)
-		}
+	if s.currentRestorePath() == "" {
+		return
 	}
+
+	if !leader {
+		// Another node is performing the restore. This node has nothing to
+		// install, so it drops its staged restore file and becomes ready to
+		// catch up with the cluster log via normal Raft replication.
+		s.logger.Printf("different node became leader, not performing auto-restore")
+		stats.Add(numAutoRestoresSkipped, 1)
+		path := s.currentRestorePath()
+		s.clearRestorePath(RestoreStateSkipped)
+		if err := fsutil.Remove(path); err != nil {
+			s.logger.Printf("failed to remove restore path after skip %s: %s",
+				path, err.Error())
+		}
+		close(s.restoreDoneCh)
+		return
+	}
+
+	// Become leader: install the staged restore. The node stays not-ready
+	// until this succeeds.
+	path := s.currentRestorePath()
+	s.logger.Printf("this node is now leader, auto-restoring from %s", path)
+	s.restoreMu.Lock()
+	s.restoreAttempt++
+	attempt := s.restoreAttempt
+	s.restoreMu.Unlock()
+	s.setRestoreState(RestoreStateInProgress, nil)
+
+	if err := s.installRestore(); err != nil {
+		// Do NOT announce success and do NOT remove the staged file or close
+		// the ready channel. The node remains not-ready in a retryable failed
+		// state, preserving evidence for manual inspection and a later retry.
+		s.logger.Printf("failed to auto-restore from %s (attempt %d): %s",
+			path, attempt, err.Error())
+		stats.Add(numAutoRestoresFailed, 1)
+		s.setRestoreState(RestoreStateFailed, err)
+		return
+	}
+
+	stats.Add(numAutoRestores, 1)
+	s.logger.Printf("node auto-restored successfully from %s", path)
+	s.completeRestore()
+}
+
+// completeRestore marks the staged auto-restore as applied, removes its
+// staging file and signals readiness. After this point the node rejoins the
+// Raft log and catches up with the cluster.
+func (s *Store) completeRestore() {
+	path := s.currentRestorePath()
+	s.clearRestorePath(RestoreStateSucceeded)
+	if err := fsutil.Remove(path); err != nil {
+		s.logger.Printf("failed to remove restore path after restore %s: %s",
+			path, err.Error())
+	}
+	close(s.restoreDoneCh)
 }
 
 // discardSnapshotBaseline removes everything on disk which describes the SQLite
@@ -3262,7 +3313,14 @@ func (s *Store) createSnapshotFingerprint(index, term uint64) error {
 }
 
 func (s *Store) installRestore() error {
-	f, err := os.Open(s.restorePath)
+	// A restore is applied through a Raft Load command, so the node must be
+	// leader. Attempting it from another state fails cleanly and leaves the
+	// staged restore in place for a later retry rather than consuming it.
+	if s.raft == nil || s.raft.State() != raft.Leader {
+		return fmt.Errorf("%w: node is not leader", ErrNotLeader)
+	}
+	restorePath := s.currentRestorePath()
+	f, err := os.Open(restorePath)
 	if err != nil {
 		return err
 	}

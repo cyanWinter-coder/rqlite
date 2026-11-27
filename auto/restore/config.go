@@ -17,7 +17,14 @@ type Config struct {
 	Type              auto.StorageType `json:"type"`
 	Timeout           auto.Duration    `json:"timeout,omitempty"`
 	ContinueOnFailure bool             `json:"continue_on_failure,omitempty"`
-	Sub               json.RawMessage  `json:"sub"`
+
+	// QuarantinePath is the directory where snapshots that fail checksum
+	// verification are preserved, together with their original verification
+	// metadata, for manual investigation. If empty it defaults to a
+	// "quarantine" directory alongside the node's data directory.
+	QuarantinePath string `json:"quarantine_path,omitempty"`
+
+	Sub json.RawMessage `json:"sub"`
 }
 
 // ReadConfigFile reads the config file and returns the data. It also expands

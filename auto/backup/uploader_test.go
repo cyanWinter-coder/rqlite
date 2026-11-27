@@ -9,7 +9,20 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rqlite/rqlite/v10/auto/verify"
 )
+
+// extractPayload verifies an uploaded object's trailer and returns the raw
+// payload bytes the provider produced.
+func extractPayload(t *testing.T, object []byte) string {
+	t.Helper()
+	_, payload, err := verify.VerifyBytes(object)
+	if err != nil {
+		t.Fatalf("uploaded object failed verification: %s", err)
+	}
+	return string(payload)
+}
 
 func Test_NewUploader(t *testing.T) {
 	ResetStats()
@@ -48,7 +61,7 @@ func Test_UploaderSingleUpload(t *testing.T) {
 
 	done := uploader.Start(ctx, nil)
 	wg.Wait()
-	if exp, got := "my upload data", string(uploadedData); exp != got {
+	if exp, got := "my upload data", extractPayload(t, uploadedData); exp != got {
 		t.Errorf("expected uploadedData to be %s, got %s", exp, got)
 	}
 
@@ -127,7 +140,7 @@ func Test_UploaderDoubleUpload(t *testing.T) {
 	wg.Wait()
 	cancel()
 	<-done
-	if exp, got := "my upload data", string(uploadedData); exp != got {
+	if exp, got := "my upload data", extractPayload(t, uploadedData); exp != got {
 		t.Errorf("expected uploadedData to be %s, got %s", exp, got)
 	}
 }
@@ -139,20 +152,16 @@ func Test_UploaderFailThenOK(t *testing.T) {
 	var err error
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 	sc := &mockStorageClient{
 		uploadFn: func(ctx context.Context, reader io.Reader, id string) error {
-			if uploadCount == 2 {
-				// uploadFn can be called a third time before the cancel kicks in.
-				// This would push waitGroup into negative numbers and panic.
-				return nil
-			}
-			defer wg.Done()
-			if uploadCount == 0 {
-				uploadCount++
+			uploadCount++
+			if uploadCount == 1 {
+				// Upload failures are retried with a fresh, complete
+				// verifiable object rather than promoted as half-snapshots.
 				return fmt.Errorf("failed to upload")
 			}
-
+			defer wg.Done()
 			uploadedData, err = io.ReadAll(reader)
 			return err
 		},
@@ -167,14 +176,21 @@ func Test_UploaderFailThenOK(t *testing.T) {
 		return 1, nil
 	}
 	uploader := NewUploader(sc, dp, 100*time.Millisecond)
+	uploader.retryInterval = time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := uploader.Start(ctx, nil)
 	wg.Wait()
 	cancel()
 	<-done
-	if exp, got := "my upload data", string(uploadedData); exp != got {
+	if exp, got := "my upload data", extractPayload(t, uploadedData); exp != got {
 		t.Errorf("expected uploadedData to be %s, got %s", exp, got)
+	}
+	if uploadCount != 2 {
+		t.Fatalf("expected the failed upload to be retried once, got %d attempts", uploadCount)
+	}
+	if got := stats.Get(numUploadsRetried).(*expvar.Int).Value(); got != 1 {
+		t.Fatalf("expected numUploadsRetried to be 1, got %d", got)
 	}
 }
 
@@ -213,7 +229,7 @@ func Test_UploaderProvideFailThenOK(t *testing.T) {
 	if exp, got := 2, provideCount; exp != got {
 		t.Errorf("expected Provide to be called %d times, got %d", exp, got)
 	}
-	if exp, got := "my upload data", string(uploadedData); exp != got {
+	if exp, got := "my upload data", extractPayload(t, uploadedData); exp != got {
 		t.Errorf("expected uploadedData to be %q, got %q", exp, got)
 	}
 }
@@ -290,7 +306,7 @@ func Test_UploaderOKThenFail(t *testing.T) {
 	<-ch
 	cancel()
 	<-done
-	if exp, got := "my upload data", string(uploadedData); exp != got {
+	if exp, got := "my upload data", extractPayload(t, uploadedData); exp != got {
 		t.Errorf("expected uploadedData to be %s, got %s", exp, got)
 	}
 }
@@ -354,7 +370,7 @@ func Test_UploaderEnabledTrue(t *testing.T) {
 
 	done := uploader.Start(ctx, func() bool { return true })
 	wg.Wait()
-	if exp, got := string(uploadedData), "my upload data"; exp != got {
+	if exp, got := extractPayload(t, uploadedData), "my upload data"; exp != got {
 		t.Errorf("expected uploadedData to be %s, got %s", exp, got)
 	}
 	cancel()

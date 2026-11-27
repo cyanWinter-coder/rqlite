@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/rqlite/rqlite/v10/auto/verify"
 	"github.com/rqlite/rqlite/v10/db/humanize"
 	"github.com/rqlite/rqlite/v10/internal/fsutil"
 	"github.com/rqlite/rqlite/v10/internal/progress"
@@ -49,6 +50,7 @@ var stats *expvar.Map
 const (
 	numUploadsOK        = "num_uploads_ok"
 	numUploadsFail      = "num_uploads_fail"
+	numUploadsRetried   = "num_uploads_retried"
 	numUploadsSkipped   = "num_uploads_skipped"
 	numUploadsSkippedID = "num_uploads_skipped_id"
 	numSumGetFail       = "num_sum_get_fail"
@@ -66,6 +68,7 @@ func ResetStats() {
 	stats.Init()
 	stats.Add(numUploadsOK, 0)
 	stats.Add(numUploadsFail, 0)
+	stats.Add(numUploadsRetried, 0)
 	stats.Add(numUploadsSkipped, 0)
 	stats.Add(numUploadsSkippedID, 0)
 	stats.Add(numSumGetFail, 0)
@@ -152,33 +155,7 @@ func (u *Uploader) upload(ctx context.Context) error {
 		stats.Add(numUploadsSkipped, 1)
 		return nil
 	}
-
-	// Write the data to be uploaded to a temporary file. Each attempt gets
-	// a new file, so a failed attempt cannot leave partial data behind for
-	// a later, smaller, attempt to upload.
-	var fd *os.File
-	for n := 0; ; n++ {
-		fd, err = tempFD()
-		if err != nil {
-			return err
-		}
-		err = u.dataProvider.Provide(fd)
-		if err == nil {
-			break
-		}
-		fd.Close()
-		fsutil.Remove(fd.Name())
-		if n >= u.nRetries {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(u.retryInterval):
-		}
-	}
-	defer fsutil.Remove(fd.Name())
-	defer fd.Close()
+	id := strconv.FormatUint(li, 10)
 
 	if u.lastIndex == 0 {
 		// No last index, so this must be the first upload since this
@@ -187,10 +164,74 @@ func (u *Uploader) upload(ctx context.Context) error {
 		if err != nil {
 			stats.Add(numSumGetFail, 1)
 			u.logger.Printf("failed to get current ID from %s: %v", u.storageClient, err)
-		} else if currID == strconv.FormatUint(li, 10) {
+		} else if currID == id {
 			stats.Add(numUploadsSkippedID, 1)
 			return nil
 		}
+	}
+
+	// Build and upload the verifiable snapshot inside a single retry loop.
+	// Every attempt works on a fresh temporary file that is removed on
+	// failure, so an interrupted attempt can never leave a half-written
+	// object that a later, smaller upload or a restore might mistake for a
+	// valid snapshot. The object only becomes "the current backup" once the
+	// storage client reports a successful, complete upload.
+	var lastErr error
+	for attempt := 0; attempt <= u.nRetries; attempt++ {
+		if attempt > 0 {
+			stats.Add(numUploadsRetried, 1)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(u.retryInterval):
+			}
+		}
+		lastErr = u.attemptUpload(ctx, id)
+		if lastErr == nil {
+			break
+		}
+		u.logger.Printf("upload attempt %d/%d to %s failed: %v",
+			attempt+1, u.nRetries+1, u.storageClient, lastErr)
+	}
+	if lastErr != nil {
+		stats.Add(numUploadsFail, 1)
+		return lastErr
+	}
+
+	// Successful upload!
+	u.lastIndex = li
+	stats.Add(numUploadsOK, 1)
+	return nil
+}
+
+// attemptUpload performs one complete prepare-and-upload cycle. It builds the
+// payload in a temporary file, appends the self-describing verification
+// trailer, and uploads the resulting object. Any error leaves only the local
+// temporary file behind, which is always removed; nothing in the storage
+// service is promoted or renamed by this method.
+func (u *Uploader) attemptUpload(ctx context.Context, id string) (retErr error) {
+	fd, err := tempFD()
+	if err != nil {
+		return err
+	}
+	defer fsutil.Remove(fd.Name())
+	defer fd.Close()
+
+	// Compute the checksum while the provider streams the payload, then
+	// persist the algorithm and checksum in the trailer so receivers verify
+	// against metadata carried by the object itself.
+	vw, err := verify.NewWriter(fd, verify.AlgorithmCRC32Castagnoli, id)
+	if err != nil {
+		return err
+	}
+	if err := u.dataProvider.Provide(vw); err != nil {
+		return fmt.Errorf("preparing snapshot data: %w", err)
+	}
+	if err := vw.Close(); err != nil {
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		return fmt.Errorf("syncing staged snapshot: %w", err)
 	}
 
 	if _, err := fd.Seek(0, io.SeekStart); err != nil {
@@ -198,15 +239,10 @@ func (u *Uploader) upload(ctx context.Context) error {
 	}
 	cr := progress.NewCountingReader(fd)
 	startTime := time.Now()
-	err = u.storageClient.Upload(ctx, cr, strconv.FormatUint(li, 10))
-	if err != nil {
-		stats.Add(numUploadsFail, 1)
-		return err
+	if err := u.storageClient.Upload(ctx, cr, id); err != nil {
+		return fmt.Errorf("uploading snapshot: %w", err)
 	}
 
-	// Successful upload!
-	u.lastIndex = li
-	stats.Add(numUploadsOK, 1)
 	stats.Add(totalUploadBytes, cr.Count())
 	stats.Get(lastUploadBytes).(*expvar.Int).Set(cr.Count())
 	u.lastUploadTime = time.Now()
