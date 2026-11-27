@@ -24,6 +24,14 @@ var gaugeOverrides = map[string]map[string]bool{
 		"reap_snapshots": true,
 		"reap_wals":      true,
 	},
+	"admission": {
+		"capacity":   true,
+		"wait_limit": true,
+		"in_flight":  true,
+		"waiting":    true,
+		"clients":    true,
+		"fair_share": true,
+	},
 }
 
 // unitOverrides lists metrics whose units cannot be determined from their

@@ -52,6 +52,14 @@ func Test_Classify(t *testing.T) {
 		{"db.wal", "compact_frames_output", true, ""},
 		{"snapshot", "reap_snapshots", true, ""},
 		{"snapshot", "reap_wals", true, ""},
+		{"admission", "capacity", true, ""},
+		{"admission", "wait_limit", true, ""},
+		{"admission", "in_flight", true, ""},
+		{"admission", "waiting", true, ""},
+		{"admission", "clients", true, ""},
+		{"admission", "fair_share", true, ""},
+		// Admission wait time is a gauge via the duration naming convention.
+		{"admission", "last_wait_duration", true, "ms"},
 
 		// Overrides are per-map, so the same key elsewhere is a counter.
 		{"store", "reap_snapshots", false, ""},

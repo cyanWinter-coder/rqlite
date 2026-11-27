@@ -130,6 +130,14 @@ type Config struct {
 	WriteQueueTx bool
 	// How many times to retry a queued write
 	WriteQueueRetry int
+	// Maximum number of write requests in flight at once. Zero or below disables bounded write admission
+	WriteGateCapacity int
+	// Maximum number of write requests that may wait for a slot before being rejected
+	WriteGateWaitLimit int
+	// Maximum slots a single client may occupy while other clients wait. Zero selects half the capacity
+	WriteGateFairShare int
+	// Maximum time a write request waits for a slot before it fails and releases its memory
+	WriteGateWaitTimeout time.Duration
 	// Path to automatic backup configuration file. If not set, not enabled
 	AutoBackupFile string
 	// Path to automatic restore configuration file. If not set, not enabled
@@ -223,6 +231,10 @@ func Forge(arguments []string) (*flag.FlagSet, *Config, error) {
 	fs.DurationVar(&config.WriteQueueTimeout, "write-queue-timeout", mustParseDuration("50ms"), "Queued Writes queue timeout")
 	fs.BoolVar(&config.WriteQueueTx, "write-queue-tx", false, "Use a transaction when processing a queued write")
 	fs.IntVar(&config.WriteQueueRetry, "write-queue-retry", 1, "How many times to retry a queued write")
+	fs.IntVar(&config.WriteGateCapacity, "write-gate-capacity", 1024, "Maximum number of write requests in flight at once. Set to 0 to disable bounded write admission")
+	fs.IntVar(&config.WriteGateWaitLimit, "write-gate-wait-limit", 1024, "Maximum number of write requests that may wait for a slot before being rejected")
+	fs.IntVar(&config.WriteGateFairShare, "write-gate-fair-share", 0, "Maximum slots a single client may occupy while other clients wait. 0 uses half the capacity")
+	fs.DurationVar(&config.WriteGateWaitTimeout, "write-gate-wait-timeout", mustParseDuration("30s"), "Maximum time a write request waits for a slot before failing")
 	fs.StringVar(&config.AutoBackupFile, "auto-backup", "", "Path to automatic backup configuration file. If not set, not enabled")
 	fs.StringVar(&config.AutoRestoreFile, "auto-restore", "", "Path to automatic restore configuration file. If not set, not enabled")
 	fs.StringVar(&config.CDCConfig, "cdc-config", "", "Set CDC HTTP endpoint, or path to CDC config file. If not set, CDC not enabled")

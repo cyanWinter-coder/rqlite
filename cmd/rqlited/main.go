@@ -525,6 +525,10 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 	s.DefaultQueueBatchSz = cfg.WriteQueueBatchSz
 	s.DefaultQueueTimeout = cfg.WriteQueueTimeout
 	s.DefaultQueueTx = cfg.WriteQueueTx
+	s.WriteGateCap = cfg.WriteGateCapacity
+	s.WriteGateWaitLimit = cfg.WriteGateWaitLimit
+	s.WriteGateFairShare = cfg.WriteGateFairShare
+	s.WriteGateWaitTimeout = cfg.WriteGateWaitTimeout
 	s.BuildInfo = map[string]any{
 		"commit":             cmd.Commit,
 		"version":            cmd.Version,

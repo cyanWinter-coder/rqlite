@@ -640,6 +640,50 @@ If a node fails to send to a queued write to the Leader it will retry the attemp
 default = 1
 
 [[flags]]
+name = "WriteGateCapacity"
+cli = "write-gate-capacity"
+section = "Queued Writes"
+type = "int"
+short_help = "Maximum number of write requests in flight at once. Set to 0 to disable bounded write admission"
+long_help = """
+Bounds the memory used by concurrent write requests across every write endpoint. When the limit is reached, further writes wait for a slot up to the write-gate wait timeout; if no slot frees in time they are rejected with HTTP 503, the current queue depth, and a Retry-After hint. Rejected requests do not remain in memory. Set to 0 to disable the gate.
+"""
+default = 1024
+
+[[flags]]
+name = "WriteGateWaitLimit"
+cli = "write-gate-wait-limit"
+section = "Queued Writes"
+type = "int"
+short_help = "Maximum number of write requests that may wait for a slot before being rejected"
+long_help = """
+Bounds how many write requests may be blocked waiting for a slot. Requests beyond this limit are rejected immediately rather than waiting, so the total memory committed to writes never exceeds the gate capacity plus this wait limit.
+"""
+default = 1024
+
+[[flags]]
+name = "WriteGateFairShare"
+cli = "write-gate-fair-share"
+section = "Queued Writes"
+type = "int"
+short_help = "Maximum slots a single client may occupy while other clients wait. 0 uses half the capacity"
+long_help = """
+Keeps the shared write capacity fair across clients. A client that reaches this share cannot take more slots while other clients have requests waiting, so no single client can monopolize every slot. Spare capacity is still usable when nobody else is waiting.
+"""
+default = 0
+
+[[flags]]
+name = "WriteGateWaitTimeout"
+cli = "write-gate-wait-timeout"
+section = "Queued Writes"
+type = "time.Duration"
+short_help = "Maximum time a write request waits for a slot before failing"
+long_help = """
+Guarantees that a queued request is released and fails after this duration if no slot becomes available, so waiting requests cannot hold memory indefinitely.
+"""
+default = "30s"
+
+[[flags]]
 name = "AutoBackupFile"
 cli = "auto-backup"
 section = "Backup and restore"

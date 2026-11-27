@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rqlite/rqlite/v10/admission"
 	"github.com/rqlite/rqlite/v10/auth"
 	clstrPB "github.com/rqlite/rqlite/v10/cluster/proto"
 	"github.com/rqlite/rqlite/v10/command/encoding"
@@ -196,8 +197,24 @@ const (
 	numAuthFail                       = "auth_fail"
 	numTLSCertFetched                 = "tls_cert_fetched"
 
+	// Write-gate (bounded write admission) counters.
+	numWriteGateRejected = "write_gate_rejected"
+	numWriteGateTimedOut = "write_gate_timed_out"
+	numWriteGateClosed   = "write_gate_closed"
+
 	// default queued write retry count.
 	defaultQueueRetry = 1
+
+	// Defaults for the bounded write-admission gate. The capacity is the
+	// maximum number of write requests in flight at once; the wait limit
+	// bounds how many more may be queued before the gate rejects.
+	defaultWriteGateCap         = 1024
+	defaultWriteGateWaitLimit   = 1024
+	defaultWriteGateWaitTimeout = 30 * time.Second
+
+	// shutdownTimeout bounds how long Close waits for in-flight HTTP
+	// requests to finish before force-closing their connections.
+	shutdownTimeout = 30 * time.Second
 
 	// Default timeout for cluster communications.
 	defaultTimeout = 30 * time.Second
@@ -269,6 +286,9 @@ func ResetStats() {
 	stats.Add(numAuthOK, 0)
 	stats.Add(numAuthFail, 0)
 	stats.Add(numTLSCertFetched, 0)
+	stats.Add(numWriteGateRejected, 0)
+	stats.Add(numWriteGateTimedOut, 0)
+	stats.Add(numWriteGateClosed, 0)
 }
 
 // Service provides HTTP service.
@@ -285,6 +305,11 @@ type Service struct {
 
 	queueDone chan struct{}
 	stmtQueue *queue.Queue[*proto.Statement] // Queue for queued executes
+
+	// writeGate bounds the number of write requests in flight across every
+	// write endpoint. Nil when bounded admission is disabled.
+	writeGate       *admission.Gate
+	gateWaitTimeout time.Duration
 
 	cluster Cluster // The Cluster service.
 
@@ -310,6 +335,12 @@ type Service struct {
 	DefaultQueueTimeout time.Duration
 	DefaultQueueTx      bool
 
+	// Bounded write admission. WriteGateCap <= 0 disables the gate.
+	WriteGateCap         int
+	WriteGateWaitLimit   int
+	WriteGateFairShare   int
+	WriteGateWaitTimeout time.Duration
+
 	queueRetry atomic.Int64
 
 	seqNum int64 // Last sequence number written OK.
@@ -325,17 +356,20 @@ type Service struct {
 // the service performs no authentication and authorization checks.
 func New(addr string, store Store, cluster Cluster, pxy *proxy.Proxy, credentials CredentialStore) *Service {
 	s := &Service{
-		addr:                addr,
-		store:               store,
-		proxy:               pxy,
-		DefaultQueueCap:     1024,
-		DefaultQueueBatchSz: 128,
-		DefaultQueueTimeout: 100 * time.Millisecond,
-		cluster:             cluster,
-		start:               time.Now(),
-		statuses:            make(map[string]StatusReporter),
-		credentialStore:     credentials,
-		logger:              log.New(os.Stderr, "[http] ", log.LstdFlags),
+		addr:                 addr,
+		store:                store,
+		proxy:                pxy,
+		DefaultQueueCap:      1024,
+		DefaultQueueBatchSz:  128,
+		DefaultQueueTimeout:  100 * time.Millisecond,
+		WriteGateCap:         defaultWriteGateCap,
+		WriteGateWaitLimit:   defaultWriteGateWaitLimit,
+		WriteGateWaitTimeout: defaultWriteGateWaitTimeout,
+		cluster:              cluster,
+		start:                time.Now(),
+		statuses:             make(map[string]StatusReporter),
+		credentialStore:      credentials,
+		logger:               log.New(os.Stderr, "[http] ", log.LstdFlags),
 	}
 	s.queueRetry.Store(defaultQueueRetry)
 	s.uiHandler = http.StripPrefix("/console/", http.FileServerFS(console.Assets))
@@ -404,6 +438,27 @@ func (s *Service) Start() error {
 	s.logger.Printf("execute queue processing started with capacity %d, batch size %d, timeout %s",
 		s.DefaultQueueCap, s.DefaultQueueBatchSz, s.DefaultQueueTimeout.String())
 
+	if s.WriteGateCap > 0 {
+		s.gateWaitTimeout = s.WriteGateWaitTimeout
+		if s.gateWaitTimeout <= 0 {
+			s.gateWaitTimeout = defaultWriteGateWaitTimeout
+		}
+		waitLimit := s.WriteGateWaitLimit
+		if waitLimit < 1 {
+			waitLimit = defaultWriteGateWaitLimit
+			s.WriteGateWaitLimit = waitLimit
+		}
+		s.writeGate = admission.New(admission.Config{
+			Capacity:  s.WriteGateCap,
+			WaitLimit: waitLimit,
+			FairShare: s.WriteGateFairShare,
+		})
+		s.logger.Printf("write admission gate enabled with capacity %d, wait limit %d, wait timeout %s",
+			s.WriteGateCap, waitLimit, s.gateWaitTimeout.String())
+	} else {
+		s.logger.Println("write admission gate disabled")
+	}
+
 	go func() {
 		err := s.httpServer.Serve(s.ln)
 		if err != nil {
@@ -418,8 +473,25 @@ func (s *Service) Start() error {
 // Close closes the service.
 func (s *Service) Close() {
 	s.logger.Println("closing HTTP service on", s.ln.Addr().String())
-	if err := s.httpServer.Close(); err != nil {
-		s.logger.Println("HTTP service close error:", err.Error())
+
+	// Graceful shutdown first: stop accepting new connections and let
+	// in-flight requests, including writes, finish within the timeout. Only
+	// if that deadline passes do we force-close outstanding connections.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+		s.logger.Printf("graceful HTTP shutdown did not complete in %s, forcing close: %s",
+			shutdownTimeout.String(), err.Error())
+		if closeErr := s.httpServer.Close(); closeErr != nil {
+			s.logger.Println("HTTP service close error:", closeErr.Error())
+		}
+	}
+	shutdownCancel()
+
+	// Stop admitting new writes and fail every request still waiting for a
+	// slot with the same error. This blocks until writes already admitted
+	// finish, so an in-flight write is never cut off mid-record.
+	if s.writeGate != nil {
+		s.writeGate.Close()
 	}
 
 	s.stmtQueue.Close()
@@ -524,6 +596,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleNodes(w, r, params)
 	case r.URL.Path == "/leader":
 		s.handleLeader(w, r, params)
+	case r.URL.Path == "/write-gate":
+		s.handleWriteGate(w, r, params)
 	case strings.HasPrefix(r.URL.Path, "/readyz"):
 		stats.Add(numReadyz, 1)
 		s.handleReadyz(w, r, params)
@@ -1099,6 +1173,9 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request, qp QueryP
 		"queue":     queueStats,
 		"tls":       s.tlsStats(),
 	}
+	if s.writeGate != nil {
+		httpStatus["write_gate"] = s.writeGate.Stats()
+	}
 	ao := s.AllowOrigin()
 	if ao != "" {
 		httpStatus["allow_origin"] = ao
@@ -1496,6 +1573,15 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request, qp Query
 		}
 	}
 
+	// Bound the queued write too: the slot is held until this handler has
+	// either handed the statements to the execute queue or returned, so the
+	// number of requests holding parsed statements in memory stays bounded.
+	ticket, gateOK := s.gateWrite(w, r, stmts)
+	if !gateOK {
+		return
+	}
+	defer s.writeGate.Release(ticket)
+
 	var fc queue.FlushChannel
 	if qp.Wait() {
 		stats.Add(numQueuedExecutionsWait, 1)
@@ -1559,6 +1645,12 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams
 			return
 		}
 	}
+
+	ticket, ok := s.gateWrite(w, r, stmts)
+	if !ok {
+		return
+	}
+	defer s.writeGate.Release(ticket)
 
 	// No database timeout is set, even if one was requested. Every node must
 	// reach the same result when it applies a write, and a timeout would let
@@ -1723,6 +1815,12 @@ func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp Query
 			return
 		}
 	}
+
+	ticket, ok := s.gateWrite(w, r, stmts)
+	if !ok {
+		return
+	}
+	defer s.writeGate.Release(ticket)
 
 	resp := NewResponse()
 	resp.Results.AssociativeJSON = qp.Associative()
