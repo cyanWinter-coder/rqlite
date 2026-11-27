@@ -119,6 +119,11 @@ message CommandJoinResponse {
     string error = 1;
     string leader = 2;
     bool close_connection = 3;
+    string id = 4;
+    string leader_id = 5;
+    string state = 6;
+    bool already_member = 7;
+    string member_id = 8;
 }
 
 message CommandStepdownResponse {

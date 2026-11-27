@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -26,6 +27,7 @@ import (
 	"github.com/rqlite/rqlite/v10/cluster/disco"
 	"github.com/rqlite/rqlite/v10/cmd"
 	"github.com/rqlite/rqlite/v10/command"
+	commandproto "github.com/rqlite/rqlite/v10/command/proto"
 	"github.com/rqlite/rqlite/v10/db"
 	"github.com/rqlite/rqlite/v10/db/extensions"
 	"github.com/rqlite/rqlite/v10/db/querylog"
@@ -660,12 +662,54 @@ func createCluster(ctx context.Context, cfg *Config, hasPeers bool, client *clus
 			return fmt.Errorf("node is the only node in a single-node cluster, joining other clusters not supported")
 		}
 
-		// Explicit join operation requested, so do it.
-		j, err := joiner.Do(ctx, joins, str.ID(), cfg.RaftAdv, clusterSuf)
+		// A zero attempt count preserves the explicit "do not retry" behavior.
+		if cfg.JoinAttempts <= 0 {
+			j, err := joiner.Do(ctx, joins, str.ID(), cfg.RaftAdv, clusterSuf)
+			if err != nil {
+				return fmt.Errorf("failed to join cluster: %s", err.Error())
+			}
+			log.Println("successfully joined cluster at", j)
+			return nil
+		}
+
+		// Explicit join operation requested. Bound the synchronous wait while
+		// retaining a background reconciler that completes the join if leadership
+		// is restored after the script-facing deadline.
+		joinTotalTimeout := time.Duration(cfg.JoinAttempts) * cfg.JoinInterval
+		if joinTotalTimeout <= 0 {
+			joinTotalTimeout = 30 * time.Second
+		}
+		joiner.SetTotalTimeout(joinTotalTimeout)
+		joinManager := cluster.NewJoinManager(
+			func(joinCtx context.Context, _ *commandproto.JoinRequest) (*cluster.JoinResult, error) {
+				return joiner.DoWithResult(joinCtx, joins, str.ID(), cfg.RaftAdv, clusterSuf)
+			},
+			cluster.WithManagerContext(ctx),
+			cluster.WithJoinWaitTimeout(joinTotalTimeout),
+		)
+		if err := httpServ.RegisterStatus("join", joinManager); err != nil {
+			return err
+		}
+
+		req := &commandproto.JoinRequest{
+			Id:      str.ID(),
+			Address: cfg.RaftAdv,
+			Voter:   clusterSuf == commandproto.Suffrage_VOTER,
+		}
+		result, err := joinManager.Join(ctx, req)
 		if err != nil {
+			if errors.Is(err, cluster.ErrJoinTimeout) || errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("join to %s did not complete within %s: %s; background reconciliation will continue",
+					joins, joinTotalTimeout, err.Error())
+				return nil
+			}
 			return fmt.Errorf("failed to join cluster: %s", err.Error())
 		}
-		log.Println("successfully joined cluster at", j)
+		if result != nil && result.Leader != "" {
+			log.Println("successfully joined cluster at", result.Joinee, "leader", result.Leader, "member", result.MemberID)
+		} else {
+			log.Println("successfully joined cluster")
+		}
 		return nil
 	}
 

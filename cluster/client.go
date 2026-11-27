@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -479,12 +480,21 @@ func (c *Client) Notify(ctx context.Context, nr *command.NotifyRequest, nodeAddr
 // If creds is nil, then no credential information will be included in
 // the Join request to the remote node.
 func (c *Client) Join(ctx context.Context, jr *command.JoinRequest, nodeAddr string, creds *proto.Credentials, timeout time.Duration) error {
+	_, err := c.JoinResponse(ctx, jr, nodeAddr, creds, timeout)
+	return err
+}
+
+// JoinResponse is Join, but returns the leader's complete response. The
+// response is non-nil whenever a server produced a protocol-level reply,
+// including replies that carry an error.
+func (c *Client) JoinResponse(ctx context.Context, jr *command.JoinRequest, nodeAddr string, creds *proto.Credentials, timeout time.Duration) (*proto.CommandJoinResponse, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
+	var lastResp *proto.CommandJoinResponse
 	for i := 0; i < maxRedirects; i++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return lastResp, err
 		}
 		command := &proto.Command{
 			Type: proto.Command_COMMAND_TYPE_JOIN,
@@ -495,22 +505,65 @@ func (c *Client) Join(ctx context.Context, jr *command.JoinRequest, nodeAddr str
 		}
 		a := &proto.CommandJoinResponse{}
 		if err := c.roundTrip(nodeAddr, command, timeout, a); err != nil {
-			return err
+			return nil, err
 		}
+		lastResp = a
 
 		if a.Error != "" {
 			if a.Error == "not leader" {
 				if a.Leader == "" {
-					return errors.New("no leader")
+					return a, ErrNoLeader
 				}
 				nodeAddr = a.Leader
 				continue
 			}
-			return errors.New(a.Error)
+			return a, &JoinRPCError{
+				Response:  a,
+				Message:   a.Error,
+				Retryable: isRetryableJoinResponseError(a.Error),
+			}
 		}
-		return nil
+		return a, nil
 	}
-	return errors.New("max redirects exceeded")
+	return lastResp, errors.New("max redirects exceeded")
+}
+
+// JoinRPCError is a join error returned by a remote cluster service. It keeps
+// the original response and records whether the failure may clear by retrying.
+type JoinRPCError struct {
+	Response  *proto.CommandJoinResponse
+	Message   string
+	Retryable bool
+}
+
+func (e *JoinRPCError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+// NonRetryableJoinError allows retry loops to use errors.As without depending
+// on this concrete type.
+func (e *JoinRPCError) NonRetryableJoinError() bool { return !e.Retryable }
+
+func isRetryableJoinResponseError(msg string) bool {
+	switch {
+	case msg == "":
+		return true
+	case strings.Contains(msg, "join would replace"),
+		strings.Contains(msg, "more than one node"),
+		strings.Contains(msg, "JoinRequest is nil"),
+		strings.Contains(msg, "node required"),
+		strings.Contains(msg, "unauthorized"),
+		strings.Contains(msg, "forbidden"),
+		strings.Contains(msg, "permission"):
+		return false
+	default:
+		// Raft leadership/configuration and transient store errors are safe to
+		// retry because identical joins are idempotent.
+		return true
+	}
 }
 
 // BroadcastHWM performs a broadcast to all specified nodes.

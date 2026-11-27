@@ -1093,6 +1093,11 @@ type CommandJoinResponse struct {
 	Error           string                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
 	Leader          string                 `protobuf:"bytes,2,opt,name=leader,proto3" json:"leader,omitempty"`
 	CloseConnection bool                   `protobuf:"varint,3,opt,name=close_connection,json=closeConnection,proto3" json:"close_connection,omitempty"`
+	Id              string                 `protobuf:"bytes,4,opt,name=id,proto3" json:"id,omitempty"`
+	LeaderId        string                 `protobuf:"bytes,5,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	State           string                 `protobuf:"bytes,6,opt,name=state,proto3" json:"state,omitempty"`
+	AlreadyMember   bool                   `protobuf:"varint,7,opt,name=already_member,json=alreadyMember,proto3" json:"already_member,omitempty"`
+	MemberId        string                 `protobuf:"bytes,8,opt,name=member_id,json=memberId,proto3" json:"member_id,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1146,6 +1151,41 @@ func (x *CommandJoinResponse) GetCloseConnection() bool {
 		return x.CloseConnection
 	}
 	return false
+}
+
+func (x *CommandJoinResponse) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *CommandJoinResponse) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
+func (x *CommandJoinResponse) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *CommandJoinResponse) GetAlreadyMember() bool {
+	if x != nil {
+		return x.AlreadyMember
+	}
+	return false
+}
+
+func (x *CommandJoinResponse) GetMemberId() string {
+	if x != nil {
+		return x.MemberId
+	}
+	return ""
 }
 
 type CommandStepdownResponse struct {
@@ -1390,11 +1430,16 @@ const file_message_proto_rawDesc = "" +
 	"\x10close_connection\x18\x02 \x01(\bR\x0fcloseConnection\"X\n" +
 	"\x15CommandNotifyResponse\x12\x14\n" +
 	"\x05error\x18\x01 \x01(\tR\x05error\x12)\n" +
-	"\x10close_connection\x18\x02 \x01(\bR\x0fcloseConnection\"n\n" +
+	"\x10close_connection\x18\x02 \x01(\bR\x0fcloseConnection\"\xf5\x01\n" +
 	"\x13CommandJoinResponse\x12\x14\n" +
 	"\x05error\x18\x01 \x01(\tR\x05error\x12\x16\n" +
 	"\x06leader\x18\x02 \x01(\tR\x06leader\x12)\n" +
-	"\x10close_connection\x18\x03 \x01(\bR\x0fcloseConnection\"Z\n" +
+	"\x10close_connection\x18\x03 \x01(\bR\x0fcloseConnection\x12\x0e\n" +
+	"\x02id\x18\x04 \x01(\tR\x02id\x12\x1b\n" +
+	"\tleader_id\x18\x05 \x01(\tR\bleaderId\x12\x14\n" +
+	"\x05state\x18\x06 \x01(\tR\x05state\x12%\n" +
+	"\x0ealready_member\x18\a \x01(\bR\ralreadyMember\x12\x1b\n" +
+	"\tmember_id\x18\b \x01(\tR\bmemberId\"Z\n" +
 	"\x17CommandStepdownResponse\x12\x14\n" +
 	"\x05error\x18\x01 \x01(\tR\x05error\x12)\n" +
 	"\x10close_connection\x18\x03 \x01(\bR\x0fcloseConnection\"\\\n" +

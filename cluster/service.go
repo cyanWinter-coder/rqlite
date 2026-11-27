@@ -795,14 +795,46 @@ func (s *Service) handleConn(conn net.Conn) {
 			jr := c.GetJoinRequest()
 			if jr == nil {
 				resp.Error = "JoinRequest is nil"
-			} else if err := s.mgr.Join(jr); err != nil {
-				resp.Error = err.Error()
-				if err.Error() == "not leader" {
-					laddr, err := s.mgr.LeaderAddr()
-					if err != nil {
-						resp.Error = err.Error()
-					} else {
-						resp.Leader = laddr
+			} else {
+				// Rich managers can return the confirmed member and current
+				// leader atomically with the idempotent join. Keep using the
+				// core Join method for existing Manager implementations/mocks.
+				type responseJoiner interface {
+					JoinResponse(*command.JoinRequest) (*proto.CommandJoinResponse, error)
+				}
+				var joinErr error
+				if rj, ok := s.mgr.(responseJoiner); ok {
+					var detailed *proto.CommandJoinResponse
+					detailed, joinErr = rj.JoinResponse(jr)
+					if joinErr == nil && detailed != nil {
+						resp = detailed
+						resp.Error = ""
+					}
+				} else {
+					joinErr = s.mgr.Join(jr)
+				}
+
+				if joinErr != nil {
+					resp.Error = joinErr.Error()
+					if joinErr.Error() == "not leader" {
+						laddr, err := s.mgr.LeaderAddr()
+						if err != nil {
+							resp.Error = err.Error()
+						} else {
+							resp.Leader = laddr
+						}
+					}
+				} else {
+					if resp.Id == "" {
+						resp.Id = jr.Id
+					}
+					if resp.MemberId == "" {
+						resp.MemberId = jr.Id
+					}
+					if resp.Leader == "" {
+						if laddr, err := s.mgr.LeaderAddr(); err == nil {
+							resp.Leader = laddr
+						}
 					}
 				}
 			}

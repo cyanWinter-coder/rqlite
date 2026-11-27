@@ -419,6 +419,13 @@ type Store struct {
 	bootstrapped    bool
 	notifyingNodes  map[string]*Server
 
+	// membershipChangeMu serializes all read-modify-write Raft configuration
+	// changes. joinCalls tracks idempotent, shareable join generations.
+	membershipChangeMu sync.Mutex
+	joinCallsMu        sync.Mutex
+	joinCalls          map[string]*joinCall
+	activeMembership   *activeMembershipChange
+
 	ShutdownOnRemove         bool
 	NoSnapshotOnClose        bool
 	SnapshotThreshold        uint64
@@ -1456,6 +1463,8 @@ func (s *Store) Stats() (map[string]any, error) {
 		"trailing_logs":          s.numTrailingLogs,
 		"request_marshaler":      s.reqMarshaller.Stats(),
 		"nodes":                  nodes,
+		"membership_change":      s.MembershipChangeStatus(),
+		"joins":                  s.JoinStatuses(),
 		"dir":                    s.raftDir,
 		"dir_size":               dirSz,
 		"dir_size_friendly":      friendlyBytes(uint64(dirSz)),
@@ -2168,6 +2177,17 @@ func (s *Store) Notify(nr *proto.NotifyRequest) error {
 // Join joins a node, identified by id and located at addr, to this store.
 // The node must be ready to respond to Raft communications at that address.
 //
+// Join is the error-only compatibility wrapper around JoinWithResult. Join
+// requests are idempotent and safe to retry; see JoinWithResult for the
+// confirmed member state.
+func (s *Store) Join(jr *proto.JoinRequest) error {
+	_, err := s.JoinWithResult(jr)
+	return err
+}
+
+// joinNow contains the original read-check-modify Raft join operation. Callers
+// must hold membershipChangeMu (indirectly through JoinWithResult).
+//
 // If the cluster already has a node with the same ID or the same address,
 // but not both, the joining node replaces it. A joining node may only
 // replace a node of its own type: a voter replaces a voter, and a non-voter
@@ -2177,13 +2197,17 @@ func (s *Store) Notify(nr *proto.NotifyRequest) error {
 // A joining node replaces at most one node. If its ID matches one node and
 // its address matches another, ErrJoinReplacesMultiple is returned and the
 // cluster is left unchanged.
-func (s *Store) Join(jr *proto.JoinRequest) error {
+func (s *Store) joinNow(jr *proto.JoinRequest) (*JoinResult, error) {
 	if !s.open.Is() {
-		return ErrNotOpen
+		return nil, ErrNotOpen
+	}
+
+	if jr == nil {
+		return nil, ErrJoinRequestInvalid
 	}
 
 	if s.raft.State() != raft.Leader {
-		return ErrNotLeader
+		return nil, ErrNotLeader
 	}
 
 	id := jr.Id
@@ -2195,13 +2219,13 @@ func (s *Store) Join(jr *proto.JoinRequest) error {
 	// then don't consider this join attempt successful -- so the joining node
 	// will presumably try again.
 	if _, err := resolvableAddress(addr); err != nil {
-		return fmt.Errorf("failed to resolve %s: %w", addr, err)
+		return nil, fmt.Errorf("failed to resolve %s: %w", addr, err)
 	}
 
 	configFuture := s.raft.GetConfiguration()
 	if err := configFuture.Error(); err != nil {
 		s.logger.Printf("failed to get raft configuration: %v", err)
-		return err
+		return nil, err
 	}
 
 	// A node already in the configuration with either the joining node's ID
@@ -2222,14 +2246,14 @@ func (s *Store) Join(jr *proto.JoinRequest) error {
 			stats.Add(numIgnoredJoins, 1)
 			s.numIgnoredJoins++
 			s.logger.Printf("node %s at %s already member of cluster, ignoring join request", id, addr)
-			return nil
+			return s.newJoinResult(id, addr, voter, true), nil
 		}
 
 		if srvVoter := srv.Suffrage != raft.Nonvoter; srvVoter != voter {
 			stats.Add(numRejectedJoins, 1)
 			s.logger.Printf("rejecting join request from node %s at %s as %s, it would replace %s %s at %s",
 				id, addr, prettyVoter(voter), prettyVoter(srvVoter), srv.ID, srv.Address)
-			return ErrJoinSuffrageMismatch
+			return nil, ErrJoinSuffrageMismatch
 		}
 		displaced = append(displaced, srv.ID)
 	}
@@ -2237,14 +2261,14 @@ func (s *Store) Join(jr *proto.JoinRequest) error {
 		stats.Add(numRejectedJoins, 1)
 		s.logger.Printf("rejecting join request from node %s at %s, it would replace nodes %v",
 			id, addr, displaced)
-		return ErrJoinReplacesMultiple
+		return nil, ErrJoinReplacesMultiple
 	}
 
 	if len(displaced) == 1 {
 		srvID := displaced[0]
 		if err := s.remove(string(srvID)); err != nil {
 			s.logger.Printf("failed to remove node %s: %v", srvID, err)
-			return err
+			return nil, err
 		}
 		stats.Add(numRemovedBeforeJoins, 1)
 		s.logger.Printf("removed node %s prior to rejoin with changed ID or address", srvID)
@@ -2258,14 +2282,48 @@ func (s *Store) Join(jr *proto.JoinRequest) error {
 	}
 	if e := f.(raft.Future); e.Error() != nil {
 		if e.Error() == raft.ErrNotLeader {
-			return ErrNotLeader
+			return nil, ErrNotLeader
 		}
-		return e.Error()
+		return nil, e.Error()
 	}
 
 	stats.Add(numJoins, 1)
 	s.logger.Printf("node with ID %s, at %s, joined successfully as %s", id, addr, prettyVoter(voter))
-	return nil
+	return s.newJoinResult(id, addr, voter, false), nil
+}
+
+// newJoinResult reads the authoritative Raft configuration and leader state.
+// It falls back to the acknowledged request values if the local configuration
+// cannot be read immediately.
+func (s *Store) newJoinResult(id, addr string, voter, alreadyMember bool) *JoinResult {
+	result := &JoinResult{
+		MemberID:      id,
+		MemberAddr:    addr,
+		Voter:         voter,
+		AlreadyMember: alreadyMember,
+	}
+	if server, err := s.getServerByID(id); err == nil {
+		result.MemberID = string(server.ID)
+		result.MemberAddr = string(server.Address)
+		result.Voter = server.Suffrage != raft.Nonvoter
+		result.Server = &Server{
+			ID:       string(server.ID),
+			Addr:     string(server.Address),
+			Suffrage: command.SuffrageFromString(server.Suffrage.String()),
+		}
+		result.Member = result.Server
+	} else {
+		result.Server = NewServer(id, addr, voter)
+		result.Member = result.Server
+	}
+	if leader, err := s.Leader(); err == nil && leader != nil {
+		result.LeaderID = leader.ID
+		result.LeaderAddr = leader.Addr
+		result.Leader = leader
+	} else {
+		result.LeaderAddr, result.LeaderID = s.LeaderWithID()
+	}
+	return result
 }
 
 // Remove removes a node from the store.
@@ -2282,7 +2340,10 @@ func (s *Store) Remove(ctx context.Context, rn *proto.RemoveNodeRequest) error {
 	id := rn.Id
 
 	s.logger.Printf("received request to remove node %s", id)
-	if err := s.remove(id); err != nil {
+	err := s.withMembershipChange("remove", id, func() error {
+		return s.remove(id)
+	})
+	if err != nil {
 		return err
 	}
 
@@ -2313,27 +2374,29 @@ func (s *Store) Demote(ctx context.Context, dn *proto.DemoteNodeRequest) error {
 	id := dn.Id
 	s.logger.Printf("received request to demote node %s", id)
 
-	server, err := s.getServerByID(id)
-	if err != nil {
-		return err
-	}
-	if server.Suffrage != raft.Voter {
-		stats.Add(numIgnoredDemotes, 1)
-		s.logger.Printf("node %s is already a non-voter, ignoring demote request", id)
-		return nil
-	}
-
-	f := s.raft.DemoteVoter(raft.ServerID(id), 0, 0)
-	if f.Error() != nil {
-		if f.Error() == raft.ErrNotLeader {
-			return ErrNotLeader
+	return s.withMembershipChange("demote", id, func() error {
+		server, err := s.getServerByID(id)
+		if err != nil {
+			return err
 		}
-		return f.Error()
-	}
+		if server.Suffrage != raft.Voter {
+			stats.Add(numIgnoredDemotes, 1)
+			s.logger.Printf("node %s is already a non-voter, ignoring demote request", id)
+			return nil
+		}
 
-	stats.Add(numDemotes, 1)
-	s.logger.Printf("node %s demoted successfully", id)
-	return nil
+		f := s.raft.DemoteVoter(raft.ServerID(id), 0, 0)
+		if f.Error() != nil {
+			if f.Error() == raft.ErrNotLeader {
+				return ErrNotLeader
+			}
+			return f.Error()
+		}
+
+		stats.Add(numDemotes, 1)
+		s.logger.Printf("node %s demoted successfully", id)
+		return nil
+	})
 }
 
 // Promote promotes a non-voting node to a voting node, using the address
@@ -2358,27 +2421,29 @@ func (s *Store) Promote(ctx context.Context, pn *proto.PromoteNodeRequest) error
 	id := pn.Id
 	s.logger.Printf("received request to promote node %s", id)
 
-	server, err := s.getServerByID(id)
-	if err != nil {
-		return err
-	}
-	if server.Suffrage == raft.Voter {
-		stats.Add(numIgnoredPromotes, 1)
-		s.logger.Printf("node %s is already a voter, ignoring promote request", id)
-		return nil
-	}
-
-	f := s.raft.AddVoter(raft.ServerID(id), server.Address, 0, 0)
-	if f.Error() != nil {
-		if f.Error() == raft.ErrNotLeader {
-			return ErrNotLeader
+	return s.withMembershipChange("promote", id, func() error {
+		server, err := s.getServerByID(id)
+		if err != nil {
+			return err
 		}
-		return f.Error()
-	}
+		if server.Suffrage == raft.Voter {
+			stats.Add(numIgnoredPromotes, 1)
+			s.logger.Printf("node %s is already a voter, ignoring promote request", id)
+			return nil
+		}
 
-	stats.Add(numPromotes, 1)
-	s.logger.Printf("node %s promoted successfully", id)
-	return nil
+		f := s.raft.AddVoter(raft.ServerID(id), server.Address, 0, 0)
+		if f.Error() != nil {
+			if f.Error() == raft.ErrNotLeader {
+				return ErrNotLeader
+			}
+			return f.Error()
+		}
+
+		stats.Add(numPromotes, 1)
+		s.logger.Printf("node %s promoted successfully", id)
+		return nil
+	})
 }
 
 // Noop writes a noop command to the Raft log. A noop command simply
