@@ -85,6 +85,11 @@ func (qp QueryParams) Bypass() bool {
 	return qp.HasKey("bypass")
 }
 
+// ByteArray is the historical name for BlobArray.
+func (qp QueryParams) ByteArray() bool {
+	return qp.BlobArray()
+}
+
 // NoParse returns true if the query parameters indicate no SQL parsing should be performed.
 func (qp QueryParams) NoParse() bool {
 	return qp.HasKey("noparse")
@@ -101,8 +106,10 @@ func (qp QueryParams) Associative() bool {
 }
 
 // BlobArray returns true if the query parameters request BLOB array results.
+// The historical byte_array spelling remains accepted during the client
+// compatibility period.
 func (qp QueryParams) BlobArray() bool {
-	return qp.HasKey("blob_array")
+	return qp.HasKey("blob_array") || qp.HasKey("byte_array")
 }
 
 // QualifyColumns returns true if the query parameters request table-qualified column names.
@@ -205,9 +212,15 @@ func (qp QueryParams) FreshnessStrict() bool {
 	return qp.HasKey("freshness_strict")
 }
 
-// Sync returns whether the sync flag is set.
+// Sync returns whether the sync flag is set. The historical commit spelling
+// remains accepted during the client compatibility period.
 func (qp QueryParams) Sync() bool {
-	return qp.HasKey("sync")
+	return qp.HasKey("sync") || qp.HasKey("commit")
+}
+
+// Commit is the historical name for Sync.
+func (qp QueryParams) Commit() bool {
+	return qp.Sync()
 }
 
 // RaftIndex returns true if the query parameters request the Raft index

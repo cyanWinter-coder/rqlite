@@ -91,10 +91,26 @@ type Cluster interface {
 	Stats() (map[string]any, error)
 }
 
-// CredentialStore is the interface credential stores must support.
+// CredentialStore is the legacy interface credential stores must support.
+// New accepts any value and additionally recognizes optional richer decision
+// and error-returning authentication methods.
 type CredentialStore interface {
 	// AA authenticates and checks authorization for the given perm.
 	AA(username, password, perm string) bool
+}
+
+// AuthStore is an alternate name for CredentialStore.
+type AuthStore = CredentialStore
+
+// Authorizer is an intentionally broad compatibility alias. Service.New
+// type-asserts supported optional methods, so test doubles or newer auth
+// stores do not all have to implement the legacy bool method to be passed.
+type Authorizer = any
+
+// AuthDecisionProvider is implemented by credential stores that can explain
+// why an authorization request failed.
+type AuthDecisionProvider interface {
+	AADecision(username, password, perm string) auth.Decision
 }
 
 // StatusReporter is the interface status providers must implement.
@@ -269,6 +285,9 @@ func ResetStats() {
 	stats.Add(numAuthOK, 0)
 	stats.Add(numAuthFail, 0)
 	stats.Add(numTLSCertFetched, 0)
+	resetDecisionStats()
+	stats.Set("request_decisions", decisionStatsVar)
+	stats.Add("decision_total", 0)
 }
 
 // Service provides HTTP service.
@@ -314,7 +333,7 @@ type Service struct {
 
 	seqNum int64 // Last sequence number written OK.
 
-	credentialStore CredentialStore
+	credentialStore any
 
 	BuildInfo map[string]any
 
@@ -323,7 +342,7 @@ type Service struct {
 
 // New returns an uninitialized HTTP service. If credentials is nil, then
 // the service performs no authentication and authorization checks.
-func New(addr string, store Store, cluster Cluster, pxy *proxy.Proxy, credentials CredentialStore) *Service {
+func New(addr string, store Store, cluster Cluster, pxy *proxy.Proxy, credentials any) *Service {
 	s := &Service{
 		addr:                addr,
 		store:               store,
@@ -470,7 +489,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	params, err := NewQueryParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.logger.Printf("rejecting invalid query parameters for %s: %v", RequestType(r), err)
+		WriteClassifiedError(w, r, DecisionInvalidParams)
 		return
 	}
 
@@ -559,8 +579,8 @@ func (s *Service) RegisterStatus(key string, stat StatusReporter) error {
 func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermRemove) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermRemove); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -605,8 +625,8 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, qp QueryP
 func (s *Service) handleDemote(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermDemote) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermDemote); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -655,8 +675,8 @@ func (s *Service) handleDemote(w http.ResponseWriter, r *http.Request, qp QueryP
 func (s *Service) handlePromote(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermPromote) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermPromote); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -732,8 +752,8 @@ func (s *Service) handleSQLAnalyze(w http.ResponseWriter, r *http.Request, qp Qu
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	startT := time.Now()
 
-	if !s.CheckRequestPerm(r, auth.PermQuery) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermQuery); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -804,8 +824,8 @@ func (s *Service) handleSQLAnalyze(w http.ResponseWriter, r *http.Request, qp Qu
 // Backup is not performed via a proxy layer because streaming over HTTP is just that
 // - specific to HTTP and we need to handle errors mid-streaming.
 func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request, qp QueryParams) {
-	if !s.CheckRequestPerm(r, auth.PermBackup) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermBackup); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -849,7 +869,7 @@ func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request, qp QueryP
 		addr, addrErr := s.store.Leader()
 		if addrErr != nil {
 			stats.Add(numLeaderNotFound, 1)
-			http.Error(w, proxy.ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+			writeServiceUnavailableError(w, r)
 			return
 		}
 		clstrN, clstrErr := s.cluster.Backup(r.Context(), br, addr.Addr, makeCredentials(r), qp.Timeout(defaultTimeout), w)
@@ -875,8 +895,8 @@ func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request, qp QueryP
 
 // handleLoad loads the database from the given SQLite database file or SQLite dump.
 func (s *Service) handleLoad(w http.ResponseWriter, r *http.Request, qp QueryParams) {
-	if !s.CheckRequestPerm(r, auth.PermLoad) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermLoad); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -892,7 +912,7 @@ func (s *Service) handleLoad(w http.ResponseWriter, r *http.Request, qp QueryPar
 		}
 		if errors.Is(err, proxy.ErrLeaderNotFound) {
 			stats.Add(numLeaderNotFound, 1)
-			http.Error(w, proxy.ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+			writeServiceUnavailableError(w, r)
 			return true
 		}
 		if errors.Is(err, proxy.ErrUnauthorized) {
@@ -950,8 +970,8 @@ func (s *Service) handleLoad(w http.ResponseWriter, r *http.Request, qp QueryPar
 
 // handleBoot handles booting this node using a SQLite file.
 func (s *Service) handleBoot(w http.ResponseWriter, r *http.Request) {
-	if !s.CheckRequestPerm(r, auth.PermLoad) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermLoad); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -981,8 +1001,8 @@ func (s *Service) handleBoot(w http.ResponseWriter, r *http.Request) {
 
 // handleSnapshot handles a snapshot request.
 func (s *Service) handleSnapshot(w http.ResponseWriter, r *http.Request, qp QueryParams) {
-	if !s.CheckRequestPerm(r, auth.PermSnapshot) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermSnapshot); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1004,8 +1024,8 @@ func (s *Service) handleSnapshot(w http.ResponseWriter, r *http.Request, qp Quer
 
 // handleReap handles a reap request.
 func (s *Service) handleReap(w http.ResponseWriter, r *http.Request) {
-	if !s.CheckRequestPerm(r, auth.PermSnapshot) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermSnapshot); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1034,8 +1054,8 @@ func (s *Service) handleReap(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermStatus) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermStatus); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1171,8 +1191,8 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request, qp QueryP
 func (s *Service) handleNodes(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermStatus) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermStatus); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1222,8 +1242,8 @@ func (s *Service) handleNodes(w http.ResponseWriter, r *http.Request, qp QueryPa
 func (s *Service) handleLeader(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermLeaderOps) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermLeaderOps); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1334,8 +1354,8 @@ func (s *Service) handleLeader(w http.ResponseWriter, r *http.Request, qp QueryP
 
 // handleReadyz returns whether the node is ready.
 func (s *Service) handleReadyz(w http.ResponseWriter, r *http.Request, qp QueryParams) {
-	if !s.CheckRequestPerm(r, auth.PermReady) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermReady); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1412,8 +1432,8 @@ func (s *Service) handleReadyz(w http.ResponseWriter, r *http.Request, qp QueryP
 func (s *Service) handleLicenses(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermStatus) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermStatus); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1428,8 +1448,8 @@ func (s *Service) handleLicenses(w http.ResponseWriter, r *http.Request, qp Quer
 
 // handleUI serves the built-in web UI.
 func (s *Service) handleUI(w http.ResponseWriter, r *http.Request) {
-	if !s.CheckRequestPerm(r, auth.PermUI) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermUI); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -1442,8 +1462,8 @@ func (s *Service) handleUI(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleExecute(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermExecute) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermExecute); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1471,7 +1491,7 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request, qp Query
 		if err != nil {
 			if errors.Is(err, store.ErrLeaderNotFound) || errors.Is(err, store.ErrNotOpen) {
 				stats.Add(numLeaderNotFound, 1)
-				http.Error(w, store.ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+				writeServiceUnavailableError(w, r)
 				return
 			}
 			http.Error(w, fmt.Sprintf("leader address: %s", err.Error()), http.StatusInternalServerError)
@@ -1580,11 +1600,15 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams
 		}
 		if errors.Is(resultsErr, proxy.ErrLeaderNotFound) {
 			stats.Add(numLeaderNotFound, 1)
-			http.Error(w, proxy.ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+			writeServiceUnavailableError(w, r)
 			return
 		}
 		if errors.Is(resultsErr, proxy.ErrUnauthorized) {
 			http.Error(w, "remote Execute not authorized", http.StatusUnauthorized)
+			return
+		}
+		if IsServiceUnavailableError(resultsErr) {
+			writeServiceUnavailableError(w, r)
 			return
 		}
 	}
@@ -1606,8 +1630,8 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams
 func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPerm(r, auth.PermQuery) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermQuery); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1675,11 +1699,15 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryPa
 		}
 		if errors.Is(resultsErr, proxy.ErrLeaderNotFound) {
 			stats.Add(numLeaderNotFound, 1)
-			http.Error(w, proxy.ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+			writeServiceUnavailableError(w, r)
 			return
 		}
 		if errors.Is(resultsErr, proxy.ErrUnauthorized) {
 			http.Error(w, "remote query not authorized", http.StatusUnauthorized)
+			return
+		}
+		if IsServiceUnavailableError(resultsErr) {
+			writeServiceUnavailableError(w, r)
 			return
 		}
 	}
@@ -1700,8 +1728,8 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryPa
 func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	if !s.CheckRequestPermAll(r, auth.PermQuery, auth.PermExecute) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermAllDecision(r, auth.PermQuery, auth.PermExecute); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1752,11 +1780,15 @@ func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp Query
 		}
 		if errors.Is(resultsErr, proxy.ErrLeaderNotFound) {
 			stats.Add(numLeaderNotFound, 1)
-			http.Error(w, proxy.ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+			writeServiceUnavailableError(w, r)
 			return
 		}
 		if errors.Is(resultsErr, proxy.ErrUnauthorized) {
 			http.Error(w, "remote Request not authorized", http.StatusUnauthorized)
+			return
+		}
+		if IsServiceUnavailableError(resultsErr) {
+			writeServiceUnavailableError(w, r)
 			return
 		}
 	}
@@ -1777,8 +1809,8 @@ func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp Query
 // handleExpvar serves registered expvar information over HTTP.
 func (s *Service) handleExpvar(w http.ResponseWriter, r *http.Request, qp QueryParams) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if !s.CheckRequestPerm(r, auth.PermStatus) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermStatus); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1799,8 +1831,8 @@ func (s *Service) handleExpvar(w http.ResponseWriter, r *http.Request, qp QueryP
 
 // handlePprof serves pprof information over HTTP.
 func (s *Service) handlePprof(w http.ResponseWriter, r *http.Request) {
-	if !s.CheckRequestPerm(r, auth.PermStatus) {
-		w.WriteHeader(http.StatusUnauthorized)
+	if ok, authDecision := s.CheckRequestPermDecision(r, auth.PermStatus); !ok {
+		s.writeAuthError(w, r, authDecision)
 		return
 	}
 
@@ -1853,9 +1885,197 @@ func (s *Service) FormRedirect(r *http.Request) (string, error) {
 	return fmt.Sprintf("%s%s%s", leaderAPIAddr, r.URL.Path, rq), nil
 }
 
+// AuthDecision is the detailed authentication/authorization result used by
+// classification-aware HTTP handling.
+type AuthDecision = auth.Decision
+
+// Common alternate names for the detailed authorization result.
+type (
+	AccessDecision = auth.Decision
+	AuthResult     = auth.Decision
+	RequestVerdict = auth.Decision
+)
+
+type aaDecisionProvider interface {
+	AADecision(username, password, perm string) auth.Decision
+}
+
+type aaStatusProvider interface {
+	AAStatus(username, password, perm string) auth.Status
+}
+
+type aaWithResultProvider interface {
+	AAWithResult(username, password, perm string) auth.Decision
+}
+
+type aaWithReasonProvider interface {
+	AAWithReason(username, password, perm string) auth.Decision
+}
+
+type aaFullProvider interface {
+	AAFull(username, password, perm string) auth.Decision
+}
+
+type authenticateProvider interface {
+	Authenticate(username, password, perm string) auth.Decision
+}
+
+type decideProvider interface {
+	Decide(username, password, perm string) auth.Decision
+}
+
+type aaErrorProvider interface {
+	AAError(username, password, perm string) error
+}
+
+type authorizeErrorProvider interface {
+	Authorize(username, password, perm string) error
+}
+
+// RequestAuthDecision evaluates the request credentials without writing a
+// response. It never returns credential material in the decision.
+func (s *Service) RequestAuthDecision(r *http.Request, perm string) AuthDecision {
+	if s.credentialStore == nil {
+		return AuthDecision{Status: auth.StatusAllowed, Allowed: true, Authenticated: true}
+	}
+
+	username, password, ok := r.BasicAuth()
+	d := evaluateAACredentialStore(s.credentialStore, username, password, perm)
+	if d.Allowed {
+		return d
+	}
+	if d.Status == "" {
+		if !ok {
+			d.Status = auth.Status(DecisionUnauthenticated)
+		} else {
+			d.Status = auth.StatusPermissionDenied
+		}
+	}
+	return d
+}
+
+func evaluateAACredentialStore(store any, username, password, perm string) AuthDecision {
+	switch ds := store.(type) {
+	case aaDecisionProvider:
+		return ds.AADecision(username, password, perm)
+	case aaWithResultProvider:
+		return ds.AAWithResult(username, password, perm)
+	case aaWithReasonProvider:
+		return ds.AAWithReason(username, password, perm)
+	case aaFullProvider:
+		return ds.AAFull(username, password, perm)
+	case authenticateProvider:
+		return ds.Authenticate(username, password, perm)
+	case decideProvider:
+		return ds.Decide(username, password, perm)
+	case aaStatusProvider:
+		status := ds.AAStatus(username, password, perm)
+		return AuthDecision{
+			Status:  status,
+			Allowed: status == auth.StatusAllowed || status == "ok",
+			Expired: strings.Contains(strings.ToLower(string(status)), "expired"),
+		}
+	}
+
+	var err error
+	switch es := store.(type) {
+	case aaErrorProvider:
+		err = es.AAError(username, password, perm)
+	case authorizeErrorProvider:
+		err = es.Authorize(username, password, perm)
+	}
+	if err != nil {
+		return authDecisionFromError(err)
+	}
+
+	if aa, ok := store.(CredentialStore); ok {
+		if aa.AA(username, password, perm) {
+			return AuthDecision{Status: auth.StatusAllowed, Allowed: true}
+		}
+	}
+	return AuthDecision{Status: auth.StatusPermissionDenied, Allowed: false}
+}
+
+func authDecisionFromError(err error) AuthDecision {
+	status := auth.StatusPermissionDenied
+	switch {
+	case errors.Is(err, auth.ErrCredentialExpired):
+		status = auth.StatusCredentialExpired
+	case errors.Is(err, auth.ErrPermissionDenied):
+		status = auth.StatusPermissionDenied
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		status = auth.StatusInvalidCredentials
+	default:
+		msg := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(msg, "expired"):
+			status = auth.StatusCredentialExpired
+		case strings.Contains(msg, "permission") || strings.Contains(msg, "forbidden"):
+			status = auth.StatusPermissionDenied
+		case strings.Contains(msg, "credential") || strings.Contains(msg, "unauthorized"):
+			status = auth.StatusInvalidCredentials
+		}
+	}
+	return AuthDecision{Status: status, Allowed: false, Expired: status == auth.StatusCredentialExpired}
+}
+
+func (s *Service) writeAuthError(w http.ResponseWriter, r *http.Request, d AuthDecision) {
+	decision := authStatusToDecision(d.Status, r.Header.Get("Authorization") == "")
+	WriteClassifiedError(w, r, decision)
+}
+
+func authStatusToDecision(status auth.Status, noAuthorizationHeader bool) string {
+	s := strings.ToLower(string(status))
+	switch {
+	case status == auth.StatusCredentialExpired || strings.Contains(s, "expired"):
+		return DecisionCredentialExpired
+	case status == auth.StatusPermissionDenied,
+		strings.Contains(s, "permission"),
+		strings.Contains(s, "denied"),
+		s == "forbidden":
+		return DecisionPermissionDenied
+	case status == auth.StatusInvalidCredentials,
+		strings.Contains(s, "invalid_credential"),
+		strings.Contains(s, "bad_credential"):
+		if noAuthorizationHeader {
+			return DecisionUnauthenticated
+		}
+		return DecisionInvalidCredentials
+	case strings.Contains(s, "unauthor"), strings.Contains(s, "unauthenticated"), s == "anonymous":
+		return DecisionUnauthenticated
+	case s == "":
+		return DecisionPermissionDenied
+	default:
+		if _, ok := decisionHTTPStatus[string(status)]; ok {
+			return string(status)
+		}
+		return DecisionPermissionDenied
+	}
+}
+
+// IsServiceUnavailableError reports whether err represents a node/store
+// availability failure rather than a request or SQL execution failure.
+func IsServiceUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, store.ErrLeaderNotFound) || errors.Is(err, store.ErrNotOpen) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "leader not found") ||
+		strings.Contains(msg, "store not open") ||
+		strings.Contains(msg, "unavailable")
+}
+
+func writeServiceUnavailableError(w http.ResponseWriter, r *http.Request) {
+	WriteClassifiedError(w, r, DecisionServiceUnavailable)
+}
+
 // CheckRequestPerm checks if the request is authenticated and authorized
 // with the given Perm.
 func (s *Service) CheckRequestPerm(r *http.Request, perm string) (b bool) {
+	d := s.RequestAuthDecision(r, perm)
 	defer func() {
 		if b {
 			stats.Add(numAuthOK, 1)
@@ -1863,18 +2083,25 @@ func (s *Service) CheckRequestPerm(r *http.Request, perm string) (b bool) {
 			stats.Add(numAuthFail, 1)
 		}
 	}()
+	return d.Allowed
+}
 
-	// No auth store set, so no checking required.
-	if s.credentialStore == nil {
-		return true
+// CheckRequestPermDecision returns both the bool result and a classifyable
+// decision. The legacy bool remains compatible with existing callers.
+func (s *Service) CheckRequestPermDecision(r *http.Request, perm string) (bool, AuthDecision) {
+	d := s.RequestAuthDecision(r, perm)
+	if d.Allowed {
+		stats.Add(numAuthOK, 1)
+		recordRequestDecision(r, DecisionOK)
+	} else {
+		stats.Add(numAuthFail, 1)
 	}
+	return d.Allowed, d
+}
 
-	username, password, ok := r.BasicAuth()
-	if !ok {
-		username = ""
-	}
-
-	return s.credentialStore.AA(username, password, perm)
+// AuthDecisionForRequest is an alternate name for CheckRequestPermDecision.
+func (s *Service) AuthDecisionForRequest(r *http.Request, perm string) (bool, AuthDecision) {
+	return s.CheckRequestPermDecision(r, perm)
 }
 
 // CheckRequestPermAll checks if the request is authenticated and authorized
@@ -1899,11 +2126,33 @@ func (s *Service) CheckRequestPermAll(r *http.Request, perms ...string) (b bool)
 	}
 
 	for _, perm := range perms {
-		if !s.credentialStore.AA(username, password, perm) {
+		d := evaluateAACredentialStore(s.credentialStore, username, password, perm)
+		if !d.Allowed {
 			return false
 		}
 	}
 	return true
+}
+
+// CheckRequestPermAllDecision checks all perms and returns the first failed
+// detailed decision.
+func (s *Service) CheckRequestPermAllDecision(r *http.Request, perms ...string) (bool, AuthDecision) {
+	if s.credentialStore == nil {
+		stats.Add(numAuthOK, 1)
+		recordRequestDecision(r, DecisionOK)
+		return true, AuthDecision{Status: auth.StatusAllowed, Allowed: true}
+	}
+	username, password, _ := r.BasicAuth()
+	for _, perm := range perms {
+		d := evaluateAACredentialStore(s.credentialStore, username, password, perm)
+		if !d.Allowed {
+			stats.Add(numAuthFail, 1)
+			return false, d
+		}
+	}
+	stats.Add(numAuthOK, 1)
+	recordRequestDecision(r, DecisionOK)
+	return true, AuthDecision{Status: auth.StatusAllowed, Allowed: true}
 }
 
 // LeaderAddr returns the Raft address of the leader, as known by this node.
